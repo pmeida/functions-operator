@@ -18,7 +18,14 @@ package controller
 
 import (
 	"context"
+	"net/http/httptest"
+	"strings"
+	"sync"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -28,9 +35,64 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/functions-dev/func-operator/internal/manifests"
 )
+
+// imageRegistryServer serves an in-memory OCI registry the image-manifests
+// tests push synthetic plugin images to.
+var (
+	imageRegistryServer *httptest.Server
+	imageRegistryOnce   sync.Once
+)
+
+func startImageRegistry() {
+	imageRegistryOnce.Do(func() {
+		imageRegistryServer = httptest.NewServer(registry.New())
+	})
+}
+
+// ensureInfrastructureStatus creates or updates the singleton Infrastructure
+// CR's apiServerURL. Both ConsolePlugin Describes share one envtest API
+// server and Ginkgo randomizes spec order, so each BeforeEach must be able
+// to (re)assert its own value.
+func ensureInfrastructureStatus(ctx context.Context, apiServerURL string) {
+	infra := &unstructured.Unstructured{}
+	infra.SetAPIVersion(infrastructureAPIVersion)
+	infra.SetKind(infrastructureKind)
+	infra.SetName(infrastructureName)
+
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: infrastructureName}, infra)
+	if apierrors.IsNotFound(err) {
+		infra.Object["status"] = map[string]interface{}{"apiServerURL": apiServerURL}
+		Expect(k8sClient.Create(ctx, infra)).To(Succeed())
+		return
+	}
+	Expect(err).NotTo(HaveOccurred())
+	infra.Object["status"] = map[string]interface{}{"apiServerURL": apiServerURL}
+	Expect(k8sClient.Update(ctx, infra)).To(Succeed())
+}
+
+// ensureClusterVersionID creates or updates the singleton ClusterVersion
+// CR's clusterID.
+func ensureClusterVersionID(ctx context.Context, clusterID string) {
+	cv := &unstructured.Unstructured{}
+	cv.SetAPIVersion(clusterVersionAPIVersion)
+	cv.SetKind(clusterVersionKind)
+	cv.SetName(clusterVersionName)
+
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: clusterVersionName}, cv)
+	if apierrors.IsNotFound(err) {
+		cv.Object["spec"] = map[string]interface{}{"clusterID": clusterID}
+		Expect(k8sClient.Create(ctx, cv)).To(Succeed())
+		return
+	}
+	Expect(err).NotTo(HaveOccurred())
+	cv.Object["spec"] = map[string]interface{}{"clusterID": clusterID}
+	Expect(k8sClient.Update(ctx, cv)).To(Succeed())
+}
 
 var _ = Describe("ConsolePlugin Controller", func() {
 	const (
@@ -62,31 +124,11 @@ var _ = Describe("ConsolePlugin Controller", func() {
 			ConsolePluginImage: testImage,
 		}
 
-		// Create Infrastructure CR for API server URL
-		infra := &unstructured.Unstructured{}
-		infra.SetAPIVersion(infrastructureAPIVersion)
-		infra.SetKind(infrastructureKind)
-		infra.SetName(infrastructureName)
-		infra.Object["status"] = map[string]interface{}{
-			"apiServerURL": testAPIServerURL,
-		}
-		err = k8sClient.Create(ctx, infra)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			Expect(err).NotTo(HaveOccurred())
-		}
-
-		// Create ClusterVersion CR for cluster ID
-		cv := &unstructured.Unstructured{}
-		cv.SetAPIVersion(clusterVersionAPIVersion)
-		cv.SetKind(clusterVersionKind)
-		cv.SetName(clusterVersionName)
-		cv.Object["spec"] = map[string]interface{}{
-			"clusterID": testClusterID,
-		}
-		err = k8sClient.Create(ctx, cv)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			Expect(err).NotTo(HaveOccurred())
-		}
+		// Create or update the cluster-facts CRs; the image-manifests
+		// Describe shares this envtest API server and asserts different
+		// values.
+		ensureInfrastructureStatus(ctx, testAPIServerURL)
+		ensureClusterVersionID(ctx, testClusterID)
 	})
 
 	AfterEach(func() {
@@ -226,229 +268,37 @@ var _ = Describe("ConsolePlugin Controller", func() {
 		})
 	})
 
-	Context("getGHApiURL", func() {
-		It("should return ghApiUrl from ConfigMap when set", func() {
-			createConfigMap(map[string]string{
-				consolePluginConfigKey: "true",
-				"ghApiUrl":             "https://github.example.com/api/v3",
-			})
-			url := reconciler.getGHApiURL(ctx)
-			Expect(url).To(Equal("https://github.example.com/api/v3"))
-		})
-
-		It("should fall back to GH_API_URL env var when not in ConfigMap", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
-			GinkgoT().Setenv("GH_API_URL", "https://env-gh.example.com/api")
-			url := reconciler.getGHApiURL(ctx)
-			Expect(url).To(Equal("https://env-gh.example.com/api"))
-		})
-
-		It("should return empty string when not in ConfigMap and env var is unset", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
-			GinkgoT().Setenv("GH_API_URL", "")
-			url := reconciler.getGHApiURL(ctx)
-			Expect(url).To(BeEmpty())
-		})
-
-		It("should return empty string when ConfigMap does not exist", func() {
-			GinkgoT().Setenv("GH_API_URL", "")
-			url := reconciler.getGHApiURL(ctx)
-			Expect(url).To(BeEmpty())
-		})
-	})
-
-	Context("buildConsolePlugin", func() {
-		It("should build a ConsolePlugin with correct structure", func() {
-			cp := reconciler.buildConsolePlugin()
-			Expect(cp.GetAPIVersion()).To(Equal(consolePluginAPIVersion))
-			Expect(cp.GetKind()).To(Equal(consolePluginKind))
-			Expect(cp.GetName()).To(Equal(consolePluginName))
-
-			labels := cp.GetLabels()
-			Expect(labels["app"]).To(Equal(consolePluginName))
-			Expect(labels["app.kubernetes.io/managed-by"]).To(Equal("func-operator"))
-
-			spec, ok := cp.Object["spec"].(map[string]interface{})
-			Expect(ok).To(BeTrue())
-
-			backend, ok := spec["backend"].(map[string]interface{})
-			Expect(ok).To(BeTrue())
-			Expect(backend["type"]).To(Equal("Service"))
-
-			svc, ok := backend["service"].(map[string]interface{})
-			Expect(ok).To(BeTrue())
-			Expect(svc["name"]).To(Equal(consolePluginName))
-			Expect(svc["namespace"]).To(Equal(operatorNamespace))
-			Expect(svc["port"]).To(Equal(consolePluginPort))
-		})
-
-		It("should include authorization UserToken in proxy", func() {
-			cp := reconciler.buildConsolePlugin()
-			spec, ok := cp.Object["spec"].(map[string]interface{})
-			Expect(ok).To(BeTrue())
-
-			proxy, ok := spec["proxy"].([]interface{})
-			Expect(ok).To(BeTrue())
-			Expect(proxy).To(HaveLen(1))
-
-			proxyEntry, ok := proxy[0].(map[string]interface{})
-			Expect(ok).To(BeTrue())
-			Expect(proxyEntry["alias"]).To(Equal("backend"))
-			Expect(proxyEntry["authorization"]).To(Equal("UserToken"))
-		})
-	})
-
-	Context("buildDeployment", func() {
-		It("should build a Deployment with the correct image and args", func() {
-			deploy := reconciler.buildDeployment(testAPIServerURL, testClusterID, "")
-			Expect(deploy.Name).To(Equal(consolePluginName))
-			Expect(deploy.Namespace).To(Equal(operatorNamespace))
-			Expect(*deploy.Spec.Replicas).To(Equal(int32(2)))
-
-			container := deploy.Spec.Template.Spec.Containers[0]
-			Expect(container.Name).To(Equal(consolePluginName))
-			Expect(container.Image).To(Equal(testImage))
-			Expect(container.Args).To(ContainElement("--https-port=9443"))
-			Expect(container.Args).To(ContainElement("--external-api-server-url=" + testAPIServerURL))
-			Expect(container.Args).To(ContainElement("--cluster-id=" + testClusterID))
-			Expect(container.Args).NotTo(ContainElement(ContainSubstring("--gh-api-url")))
-
-			Expect(deploy.Spec.Template.Spec.ServiceAccountName).To(Equal(consolePluginName))
-			Expect(deploy.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(consolePluginCertSecret))
-		})
-
-		It("should include liveness and readiness probes", func() {
-			deploy := reconciler.buildDeployment(testAPIServerURL, testClusterID, "")
-			container := deploy.Spec.Template.Spec.Containers[0]
-
-			expectedPort := intstr.FromInt32(consolePluginPortInt32)
-
-			Expect(container.LivenessProbe).NotTo(BeNil())
-			Expect(container.LivenessProbe.HTTPGet).NotTo(BeNil())
-			Expect(container.LivenessProbe.HTTPGet.Path).To(Equal("/healthz"))
-			Expect(container.LivenessProbe.HTTPGet.Port).To(Equal(expectedPort))
-			Expect(container.LivenessProbe.HTTPGet.Scheme).To(Equal(v1.URISchemeHTTPS))
-			Expect(container.LivenessProbe.InitialDelaySeconds).To(Equal(int32(5)))
-			Expect(container.LivenessProbe.PeriodSeconds).To(Equal(int32(10)))
-
-			Expect(container.ReadinessProbe).NotTo(BeNil())
-			Expect(container.ReadinessProbe.HTTPGet).NotTo(BeNil())
-			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/healthz"))
-			Expect(container.ReadinessProbe.HTTPGet.Port).To(Equal(expectedPort))
-			Expect(container.ReadinessProbe.HTTPGet.Scheme).To(Equal(v1.URISchemeHTTPS))
-			Expect(container.ReadinessProbe.InitialDelaySeconds).To(Equal(int32(5)))
-			Expect(container.ReadinessProbe.PeriodSeconds).To(Equal(int32(10)))
-		})
-
-		It("should include --gh-api-url arg when ghApiURL is provided", func() {
-			ghURL := "https://github.example.com/api/v3"
-			deploy := reconciler.buildDeployment(testAPIServerURL, testClusterID, ghURL)
-			container := deploy.Spec.Template.Spec.Containers[0]
-			Expect(container.Args).To(ContainElement("--gh-api-url=" + ghURL))
-		})
-
-		It("should not include --gh-api-url arg when ghApiURL is empty", func() {
-			deploy := reconciler.buildDeployment(testAPIServerURL, testClusterID, "")
-			container := deploy.Spec.Template.Spec.Containers[0]
-			Expect(container.Args).NotTo(ContainElement(ContainSubstring("--gh-api-url")))
-		})
-	})
-
-	Context("buildService", func() {
-		It("should build a Service with serving-cert annotation", func() {
-			svc := reconciler.buildService()
-			Expect(svc.Name).To(Equal(consolePluginName))
-			Expect(svc.Namespace).To(Equal(operatorNamespace))
-			Expect(svc.Annotations["service.alpha.openshift.io/serving-cert-secret-name"]).To(Equal(consolePluginCertSecret))
-			Expect(svc.Spec.Ports[0].Port).To(Equal(consolePluginPortInt32))
-			Expect(svc.Spec.Type).To(Equal(v1.ServiceTypeClusterIP))
-		})
-	})
-
-	Context("buildServiceAccount", func() {
-		It("should build a ServiceAccount with correct labels", func() {
-			sa := reconciler.buildServiceAccount()
-			Expect(sa.Name).To(Equal(consolePluginName))
-			Expect(sa.Namespace).To(Equal(operatorNamespace))
-			Expect(sa.Labels["app.kubernetes.io/managed-by"]).To(Equal("func-operator"))
-		})
-	})
-
-	Context("buildRole", func() {
-		// The console plugin stores one Secret per OpenShift user.
-		It("should allow the plugin to manage its credential Secrets", func() {
-			role := reconciler.buildRole()
-			Expect(role.Name).To(Equal(consolePluginName))
-			Expect(role.Namespace).To(Equal(operatorNamespace))
-			Expect(role.Rules).To(HaveLen(1))
-
-			rule := role.Rules[0]
-			Expect(rule.APIGroups).To(Equal([]string{""}))
-			Expect(rule.Resources).To(Equal([]string{"secrets"}))
-			Expect(rule.Verbs).To(ConsistOf("create", "get", "update", "delete"))
-		})
-
-		// Namespaced on purpose: credentials never leave the namespace the
-		// operator installed into.
-		It("should not grant anything beyond secrets", func() {
-			role := reconciler.buildRole()
-
-			for _, rule := range role.Rules {
-				Expect(rule.Resources).To(ConsistOf("secrets"))
-			}
-		})
-	})
-
-	Context("buildRoleBinding", func() {
-		It("should bind the role to the plugin ServiceAccount", func() {
-			rb := reconciler.buildRoleBinding()
-			Expect(rb.Name).To(Equal(consolePluginName))
-			Expect(rb.Namespace).To(Equal(operatorNamespace))
-			Expect(rb.RoleRef.Kind).To(Equal("Role"))
-			Expect(rb.RoleRef.Name).To(Equal(consolePluginName))
-
-			Expect(rb.Subjects).To(HaveLen(1))
-			Expect(rb.Subjects[0].Kind).To(Equal(rbacv1.ServiceAccountKind))
-			Expect(rb.Subjects[0].Name).To(Equal(consolePluginName))
-			Expect(rb.Subjects[0].Namespace).To(Equal(operatorNamespace))
-		})
-	})
-
 	Context("Reconcile", func() {
-		It("should create all resources when enabled", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
-
-			result, err := doReconcile()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result).To(Equal(reconcile.Result{}))
-
-			_, err = getConsolePlugin()
-			Expect(err).NotTo(HaveOccurred())
-
-			deploy, err := getDeployment()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(testImage))
-			Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--external-api-server-url=" + testAPIServerURL))
-
-			svc, err := getService()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(svc.Annotations["service.alpha.openshift.io/serving-cert-secret-name"]).To(Equal(consolePluginCertSecret))
-
-			_, err = getServiceAccount()
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = getRole()
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = getRoleBinding()
-			Expect(err).NotTo(HaveOccurred())
-		})
-
 		It("should delete all resources when disabled", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
+			// The resources are created directly: the enabled path renders
+			// them from the plugin image, which the image-sourced manifests
+			// Describe covers.
+			pluginLabels := map[string]string{"app": consolePluginName}
+			meta := metav1.ObjectMeta{Name: consolePluginName, Namespace: operatorNamespace, Labels: pluginLabels}
+			Expect(k8sClient.Create(ctx, &v1.ServiceAccount{ObjectMeta: meta})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &rbacv1.Role{ObjectMeta: meta})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &rbacv1.RoleBinding{
+				ObjectMeta: meta,
+				RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: consolePluginName},
+			})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &v1.Service{ObjectMeta: meta, Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{{Port: 9443}},
+			}})).To(Succeed())
+			deploy := &appsv1.Deployment{ObjectMeta: meta, Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: pluginLabels},
+				Template: v1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: pluginLabels},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: consolePluginName, Image: "fixture"}}},
+				},
+			}}
+			Expect(k8sClient.Create(ctx, deploy)).To(Succeed())
+			cp := &unstructured.Unstructured{}
+			cp.SetAPIVersion(consolePluginAPIVersion)
+			cp.SetKind(consolePluginKind)
+			cp.SetName(consolePluginName)
+			Expect(k8sClient.Create(ctx, cp)).To(Succeed())
 
-			_, err := doReconcile()
-			Expect(err).NotTo(HaveOccurred())
+			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
 
 			cm := &v1.ConfigMap{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
@@ -458,7 +308,7 @@ var _ = Describe("ConsolePlugin Controller", func() {
 			cm.Data[consolePluginConfigKey] = "false"
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 
-			_, err = doReconcile()
+			_, err := doReconcile()
 			Expect(err).NotTo(HaveOccurred())
 
 			_, err = getConsolePlugin()
@@ -488,52 +338,6 @@ var _ = Describe("ConsolePlugin Controller", func() {
 			Expect(result).To(Equal(reconcile.Result{}))
 		})
 
-		It("should update existing resources when reconciled again", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
-
-			_, err := doReconcile()
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = doReconcile()
-			Expect(err).NotTo(HaveOccurred())
-
-			cp, err := getConsolePlugin()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(cp.GetName()).To(Equal(consolePluginName))
-
-			deploy, err := getDeployment()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(testImage))
-		})
-
-		It("should pass --gh-api-url to deployment when ghApiUrl is in ConfigMap", func() {
-			createConfigMap(map[string]string{
-				consolePluginConfigKey: "true",
-				"ghApiUrl":             "https://gh.example.com/api/v3",
-			})
-
-			result, err := doReconcile()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result).To(Equal(reconcile.Result{}))
-
-			deploy, err := getDeployment()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--gh-api-url=https://gh.example.com/api/v3"))
-		})
-
-		It("should not pass --gh-api-url when ghApiUrl is not set", func() {
-			createConfigMap(map[string]string{consolePluginConfigKey: "true"})
-			GinkgoT().Setenv("GH_API_URL", "")
-
-			result, err := doReconcile()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result).To(Equal(reconcile.Result{}))
-
-			deploy, err := getDeployment()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(deploy.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement(ContainSubstring("--gh-api-url")))
-		})
-
 		It("should not create resources when key is absent", func() {
 			createConfigMap(map[string]string{"autoUpdateMiddleware": "true"})
 
@@ -547,5 +351,279 @@ var _ = Describe("ConsolePlugin Controller", func() {
 			_, err = getDeployment()
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		})
+	})
+})
+
+// imagePluginManifests mirrors the templates shipped in faas-console-plugin's
+// manifests/ directory (see internal/manifests for the package under test
+// here).
+var imagePluginManifests = map[string][]byte{
+	"manifests/compatibility.yaml": []byte(`formatVersion: "1"
+`),
+	"manifests/serviceaccount.yaml": []byte(`apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+`),
+	"manifests/role.yaml": []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "update", "delete"]
+`),
+	"manifests/rolebinding.yaml": []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Name }}
+    namespace: {{ .Namespace }}
+`),
+	"manifests/service.yaml": []byte(`apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+  annotations:
+    service.alpha.openshift.io/serving-cert-secret-name: {{ .CertSecret }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9443
+`),
+	"manifests/deployment.yaml": []byte(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: {{ .Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Name }}
+    spec:
+      containers:
+        - name: {{ .Name }}
+          image: {{ .Image }}
+          args:
+            - "--https-port=9443"
+            - "--external-api-server-url={{ .APIServerURL }}"
+            - "--cluster-id={{ .ClusterID }}"
+            {{- if or .Config.ghApiUrl .Env.GH_API_URL }}
+            - "--gh-api-url={{ or .Config.ghApiUrl .Env.GH_API_URL }}"
+            {{- end }}
+`),
+	"manifests/consoleplugin.yaml": []byte(`apiVersion: console.openshift.io/v1
+kind: ConsolePlugin
+metadata:
+  name: {{ .Name }}
+spec:
+  backend:
+    type: Service
+    service:
+      name: {{ .Name }}
+      namespace: {{ .Namespace }}
+      port: 9443
+`),
+}
+
+var _ = Describe("ConsolePlugin Controller with image-sourced manifests", func() {
+	const (
+		imageNamespace  = "test-consoleplugin-image-ns"
+		imageTestRefTag = "quay.io/test/faas-console-plugin:latest"
+		imageAPIServer  = "https://api.image-test.example.com:6443"
+		imageClusterID  = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+	)
+
+	var (
+		reconciler *ConsolePluginReconciler
+		ctx        context.Context
+	)
+
+	pushTestImage := func(files map[string][]byte, tag string) string {
+		layer, err := crane.Layer(files)
+		Expect(err).NotTo(HaveOccurred())
+		img, err := mutate.Append(empty.Image, mutate.Addendum{Layer: layer})
+		Expect(err).NotTo(HaveOccurred())
+		ref := strings.TrimPrefix(imageRegistryServer.URL, "http://") + "/faas-console-plugin:" + tag
+		Expect(crane.Push(img, ref, crane.Insecure)).To(Succeed())
+		return ref
+	}
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		startImageRegistry()
+
+		ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: imageNamespace}}
+		err := k8sClient.Create(ctx, ns)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		ensureInfrastructureStatus(ctx, imageAPIServer)
+		ensureClusterVersionID(ctx, imageClusterID)
+
+		imageRef := pushTestImage(imagePluginManifests, "v1")
+		reconciler = &ConsolePluginReconciler{
+			Client:             k8sClient,
+			OperatorNamespace:  imageNamespace,
+			ConsolePluginImage: imageTestRefTag,
+			ManifestSource: &manifests.Source{
+				ImageRef: imageRef,
+				Insecure: true,
+				// The dev flow resolves a dockerconfigjson pull secret by
+				// name for the internal registry; exercise the read+parse
+				// path here (the test registry is anonymous, so the
+				// credentials simply go unused).
+				PullSecretName: "plugin-registry-auth",
+			},
+		}
+
+		pullSecret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "plugin-registry-auth", Namespace: imageNamespace},
+			Type:       v1.SecretTypeDockerConfigJson,
+			Data: map[string][]byte{
+				".dockerconfigjson": []byte(`{"auths":{"image-registry.example.com:5000":{"auth":"dW51c2VkOnMzY3JldA=="}}}`),
+			},
+		}
+		err = k8sClient.Create(ctx, pullSecret)
+		if apierrors.IsAlreadyExists(err) {
+			Expect(k8sClient.Update(ctx, pullSecret)).To(Succeed())
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+	})
+
+	doReconcile := func() (reconcile.Result, error) {
+		return reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: consolePluginName},
+		})
+	}
+
+	It("should render and apply all plugin resources from the image", func() {
+		cm := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: controllerConfigName, Namespace: imageNamespace},
+			Data: map[string]string{
+				consolePluginConfigKey: "true",
+				"ghApiUrl":             "https://fake-gh.test.example.com",
+			},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		GinkgoT().Setenv("GH_API_URL", "")
+
+		result, err := doReconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		By("creating the ConsolePlugin")
+		cp := &unstructured.Unstructured{}
+		cp.SetAPIVersion(consolePluginAPIVersion)
+		cp.SetKind(consolePluginKind)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName}, cp)).To(Succeed())
+
+		By("creating the Deployment with rendered values")
+		deploy := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, deploy)).To(Succeed())
+		Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(imageTestRefTag))
+		Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--external-api-server-url=" + imageAPIServer))
+		Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--cluster-id=" + imageClusterID))
+		Expect(deploy.Spec.Template.Spec.Containers[0].Args).To(ContainElement("--gh-api-url=https://fake-gh.test.example.com"))
+		Expect(*deploy.Spec.Replicas).To(Equal(int32(2)))
+
+		By("creating the Service with the serving-cert annotation")
+		svc := &v1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, svc)).To(Succeed())
+		Expect(svc.Annotations).To(HaveKeyWithValue("service.alpha.openshift.io/serving-cert-secret-name", consolePluginCertSecret))
+
+		By("creating the RBAC and ServiceAccount")
+		sa := &v1.ServiceAccount{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, sa)).To(Succeed())
+		role := &rbacv1.Role{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, role)).To(Succeed())
+		Expect(role.Rules).To(HaveLen(1))
+		rb := &rbacv1.RoleBinding{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, rb)).To(Succeed())
+		Expect(rb.RoleRef.Name).To(Equal(consolePluginName))
+	})
+
+	AfterEach(func() {
+		// Both specs create the controller-config ConfigMap and the plugin
+		// resources in the shared envtest API server; spec order is
+		// randomized, so each spec must clean up after itself.
+		deleteAll := func(obj client.Object) {
+			_ = k8sClient.Delete(ctx, obj)
+		}
+		deleteAll(&v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: controllerConfigName, Namespace: imageNamespace}})
+
+		cp := &unstructured.Unstructured{}
+		cp.SetAPIVersion(consolePluginAPIVersion)
+		cp.SetKind(consolePluginKind)
+		cp.SetName(consolePluginName)
+		deleteAll(cp)
+		deleteAll(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: consolePluginName, Namespace: imageNamespace}})
+		deleteAll(&v1.Service{ObjectMeta: metav1.ObjectMeta{Name: consolePluginName, Namespace: imageNamespace}})
+		deleteAll(&v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: consolePluginName, Namespace: imageNamespace}})
+		deleteAll(&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: consolePluginName, Namespace: imageNamespace}})
+		deleteAll(&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: consolePluginName, Namespace: imageNamespace}})
+	})
+
+	It("should be idempotent on a cached digest and adopt new definitions from a new image", func() {
+		cm := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: controllerConfigName, Namespace: imageNamespace},
+			Data:       map[string]string{consolePluginConfigKey: "true"},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		GinkgoT().Setenv("GH_API_URL", "")
+
+		_, err := doReconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		By("reconciling again without error (digest cache hit)")
+		_, err = doReconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		By("adopting new definitions from a new image digest")
+		changed := map[string][]byte{}
+		for k, v := range imagePluginManifests {
+			changed[k] = v
+		}
+		changed["manifests/service.yaml"] = []byte(`apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+  annotations:
+    service.alpha.openshift.io/serving-cert-secret-name: {{ .CertSecret }}
+spec:
+  type: NodePort
+  ports:
+    - port: 9443
+`)
+		reconciler.ManifestSource = &manifests.Source{
+			ImageRef: pushTestImage(changed, "v2"),
+			Insecure: true,
+		}
+
+		_, err = doReconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		svc := &v1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: imageNamespace}, svc)).To(Succeed())
+		Expect(svc.Spec.Type).To(Equal(v1.ServiceTypeNodePort))
 	})
 })

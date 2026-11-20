@@ -26,14 +26,13 @@ import (
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/functions-dev/func-operator/internal/manifests"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -72,6 +71,15 @@ type ConsolePluginReconciler struct {
 	ConsolePluginImage string
 	PodName            string
 
+	// ManifestSource, when set, renders the plugin resources from the
+	// plugin image instead of the Go builders below (SRVOCF-1095, Option
+	// B). The image is pulled in-process and cached by digest; adding or
+	// changing plugin resources is then a faas-console-plugin change only.
+	// Nil keeps the builder path.
+	ManifestSource *manifests.Source
+
+	manifestsCache *manifests.Cache
+
 	ownerInfoResolved  bool
 	deploymentOwnerRef *metav1.OwnerReference
 	clusterOwnerRef    *metav1.OwnerReference
@@ -92,6 +100,14 @@ func (r *ConsolePluginReconciler) Reconcile(ctx context.Context, _ ctrl.Request)
 	}
 
 	if enabled {
+		if r.ManifestSource == nil {
+			// Unreachable when deployed: main.go always constructs the
+			// source and refuses to start without CONSOLE_PLUGIN_IMAGE.
+			err := fmt.Errorf("console plugin manifest source is not configured (CONSOLE_PLUGIN_IMAGE)")
+			logger.Error(err, "Cannot reconcile ConsolePlugin resources")
+			return ctrl.Result{}, err
+		}
+
 		apiServerURL, err := r.getAPIServerURL(ctx)
 		if err != nil {
 			logger.Error(err, "Failed to get API server URL from Infrastructure CR")
@@ -104,30 +120,8 @@ func (r *ConsolePluginReconciler) Reconcile(ctx context.Context, _ ctrl.Request)
 			return ctrl.Result{}, err
 		}
 
-		ghApiURL := r.getGHApiURL(ctx)
-
-		if err := r.ensureServiceAccount(ctx); err != nil {
-			logger.Error(err, "Failed to ensure ServiceAccount")
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureRole(ctx); err != nil {
-			logger.Error(err, "Failed to ensure Role")
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureRoleBinding(ctx); err != nil {
-			logger.Error(err, "Failed to ensure RoleBinding")
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureService(ctx); err != nil {
-			logger.Error(err, "Failed to ensure Service")
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureDeployment(ctx, apiServerURL, clusterID, ghApiURL); err != nil {
-			logger.Error(err, "Failed to ensure Deployment")
-			return ctrl.Result{}, err
-		}
-		if err := r.ensureConsolePlugin(ctx); err != nil {
-			logger.Error(err, "Failed to ensure ConsolePlugin")
+		if err := r.ensureImageManifests(ctx, apiServerURL, clusterID); err != nil {
+			logger.Error(err, "Failed to ensure image-sourced ConsolePlugin resources")
 			return ctrl.Result{}, err
 		}
 		logger.Info("ConsolePlugin resources are reconciled")
@@ -225,19 +219,6 @@ func (r *ConsolePluginReconciler) getClusterID(ctx context.Context) (string, err
 	}
 
 	return clusterID, nil
-}
-
-func (r *ConsolePluginReconciler) getGHApiURL(ctx context.Context) string {
-	cm := &v1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: r.OperatorNamespace, Name: controllerConfigName}, cm)
-	if err != nil {
-		return ""
-	}
-	if val, ok := cm.Data["ghApiUrl"]; ok && val != "" {
-		return val
-	}
-	// Fall back to GH_API_URL environment variable
-	return os.Getenv("GH_API_URL")
 }
 
 func (r *ConsolePluginReconciler) resolveOLMOwnership(ctx context.Context) error {
@@ -383,396 +364,133 @@ func ensureOwnerRef(obj metav1.Object, ref *metav1.OwnerReference) {
 	obj.SetOwnerReferences(append(existing, *ref))
 }
 
-func consolePluginLabels() map[string]string {
-	return map[string]string{
-		"app":                          consolePluginName,
-		"app.kubernetes.io/name":       consolePluginName,
-		"app.kubernetes.io/part-of":    consolePluginName,
-		"app.kubernetes.io/managed-by": "func-operator",
-	}
-}
-
-func consolePluginSelectorLabels() map[string]string {
-	return map[string]string{
-		"app":                    consolePluginName,
-		"app.kubernetes.io/name": consolePluginName,
-	}
-}
-
-func (r *ConsolePluginReconciler) buildServiceAccount() *v1.ServiceAccount {
-	return &v1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      consolePluginName,
-			Namespace: r.OperatorNamespace,
-			Labels:    consolePluginLabels(),
-		},
-	}
-}
-
 // Faas console plugin keep SCM credentials in Secrets in its own
 // namespace.
-func (r *ConsolePluginReconciler) buildRole() *rbacv1.Role {
-	return &rbacv1.Role{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      consolePluginName,
-			Namespace: r.OperatorNamespace,
-			Labels:    consolePluginLabels(),
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"secrets"},
-				Verbs:     []string{"create", "get", "update", "delete"},
-			},
-		},
-	}
-}
 
-func (r *ConsolePluginReconciler) buildRoleBinding() *rbacv1.RoleBinding {
-	return &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      consolePluginName,
-			Namespace: r.OperatorNamespace,
-			Labels:    consolePluginLabels(),
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "Role",
-			Name:     consolePluginName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      rbacv1.ServiceAccountKind,
-				Name:      consolePluginName,
-				Namespace: r.OperatorNamespace,
-			},
-		},
-	}
-}
-
-func (r *ConsolePluginReconciler) buildService() *v1.Service {
-	return &v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      consolePluginName,
-			Namespace: r.OperatorNamespace,
-			Labels:    consolePluginLabels(),
-			Annotations: map[string]string{
-				"service.alpha.openshift.io/serving-cert-secret-name": consolePluginCertSecret,
-			},
-		},
-		Spec: v1.ServiceSpec{
-			Type:     v1.ServiceTypeClusterIP,
-			Selector: consolePluginSelectorLabels(),
-			Ports: []v1.ServicePort{
-				{
-					Name:       "9443-tcp",
-					Protocol:   v1.ProtocolTCP,
-					Port:       consolePluginPortInt32,
-					TargetPort: intstr.FromInt32(consolePluginPortInt32),
-				},
-			},
-		},
-	}
-}
-
-func (r *ConsolePluginReconciler) buildDeployment(apiServerURL, clusterID, ghApiURL string) *appsv1.Deployment {
-	args := []string{
-		"--https-port=9443",
-		fmt.Sprintf("--external-api-server-url=%s", apiServerURL),
-		fmt.Sprintf("--cluster-id=%s", clusterID),
-	}
-	if ghApiURL != "" {
-		args = append(args, fmt.Sprintf("--gh-api-url=%s", ghApiURL))
+// imageManifestValues assembles the render inputs for image-sourced plugin
+// manifests: deployment coordinates, cluster facts, and the controller-config
+// ConfigMap verbatim so plugin templates can read feature knobs (.Config)
+// without per-knob operator code.
+func (r *ConsolePluginReconciler) imageManifestValues(ctx context.Context, apiServerURL, clusterID string) (manifests.Values, error) {
+	vals := manifests.Values{
+		Namespace:    r.OperatorNamespace,
+		Name:         consolePluginName,
+		Image:        r.ConsolePluginImage,
+		APIServerURL: apiServerURL,
+		ClusterID:    clusterID,
+		CertSecret:   consolePluginCertSecret,
+		Env:          map[string]string{"GH_API_URL": os.Getenv("GH_API_URL")},
 	}
 
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      consolePluginName,
-			Namespace: r.OperatorNamespace,
-			Labels:    consolePluginLabels(),
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(2)),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: consolePluginSelectorLabels(),
-			},
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxUnavailable: ptr.To(intstr.FromString("25%")),
-					MaxSurge:       ptr.To(intstr.FromString("25%")),
-				},
-			},
-			Template: v1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: consolePluginLabels(),
-				},
-				Spec: v1.PodSpec{
-					ServiceAccountName: consolePluginName,
-					RestartPolicy:      v1.RestartPolicyAlways,
-					DNSPolicy:          v1.DNSClusterFirst,
-					SecurityContext: &v1.PodSecurityContext{
-						RunAsNonRoot: ptr.To(true),
-						SeccompProfile: &v1.SeccompProfile{
-							Type: v1.SeccompProfileTypeRuntimeDefault,
-						},
-					},
-					Containers: []v1.Container{
-						{
-							Name:            consolePluginName,
-							Image:           r.ConsolePluginImage,
-							ImagePullPolicy: v1.PullIfNotPresent,
-							Args:            args,
-							Ports: []v1.ContainerPort{
-								{
-									ContainerPort: consolePluginPortInt32,
-									Protocol:      v1.ProtocolTCP,
-								},
-							},
-							LivenessProbe: &v1.Probe{
-								ProbeHandler: v1.ProbeHandler{
-									HTTPGet: &v1.HTTPGetAction{
-										Path:   "/healthz",
-										Port:   intstr.FromInt32(consolePluginPortInt32),
-										Scheme: v1.URISchemeHTTPS,
-									},
-								},
-								InitialDelaySeconds: 5,
-								PeriodSeconds:       10,
-							},
-							ReadinessProbe: &v1.Probe{
-								ProbeHandler: v1.ProbeHandler{
-									HTTPGet: &v1.HTTPGetAction{
-										Path:   "/healthz",
-										Port:   intstr.FromInt32(consolePluginPortInt32),
-										Scheme: v1.URISchemeHTTPS,
-									},
-								},
-								InitialDelaySeconds: 5,
-								PeriodSeconds:       10,
-							},
-							Resources: v1.ResourceRequirements{
-								Requests: v1.ResourceList{
-									v1.ResourceCPU:    *parseQuantity("10m"),
-									v1.ResourceMemory: *parseQuantity("50Mi"),
-								},
-							},
-							SecurityContext: &v1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-								Capabilities: &v1.Capabilities{
-									Drop: []v1.Capability{"ALL"},
-								},
-							},
-							VolumeMounts: []v1.VolumeMount{
-								{
-									Name:      consolePluginCertSecret,
-									ReadOnly:  true,
-									MountPath: consolePluginCertMount,
-								},
-							},
-						},
-					},
-					Volumes: []v1.Volume{
-						{
-							Name: consolePluginCertSecret,
-							VolumeSource: v1.VolumeSource{
-								Secret: &v1.SecretVolumeSource{
-									SecretName:  consolePluginCertSecret,
-									DefaultMode: ptr.To(int32(420)),
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func (r *ConsolePluginReconciler) buildConsolePlugin() *unstructured.Unstructured {
-	cp := &unstructured.Unstructured{}
-	cp.SetAPIVersion(consolePluginAPIVersion)
-	cp.SetKind(consolePluginKind)
-	cp.SetName(consolePluginName)
-	cp.SetLabels(consolePluginLabels())
-
-	cp.Object["spec"] = map[string]interface{}{
-		"displayName": "OpenShift Serverless Functions Console Plugin",
-		"i18n": map[string]interface{}{
-			"loadType": "Preload",
-		},
-		"backend": map[string]interface{}{
-			"type": "Service",
-			"service": map[string]interface{}{
-				"name":      consolePluginName,
-				"namespace": r.OperatorNamespace,
-				"port":      consolePluginPort,
-				"basePath":  consolePluginBasePath,
-			},
-		},
-		"proxy": []interface{}{
-			map[string]interface{}{
-				"alias":         "backend",
-				"authorization": "UserToken",
-				"endpoint": map[string]interface{}{
-					"type": "Service",
-					"service": map[string]interface{}{
-						"name":      consolePluginName,
-						"namespace": r.OperatorNamespace,
-						"port":      consolePluginPort,
-					},
-				},
-			},
-		},
-	}
-
-	return cp
-}
-
-func (r *ConsolePluginReconciler) ensureServiceAccount(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-	desired := r.buildServiceAccount()
-	ensureOwnerRef(desired, r.deploymentOwnerRef)
-
-	existing := &v1.ServiceAccount{}
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: r.OperatorNamespace}, existing)
+	cm := &v1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: r.OperatorNamespace, Name: controllerConfigName}, cm)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating ServiceAccount", "name", consolePluginName)
-		return r.Create(ctx, desired)
+		return vals, nil
 	}
 	if err != nil {
-		return fmt.Errorf("failed to get ServiceAccount: %w", err)
+		return vals, fmt.Errorf("failed to get operator config configmap: %w", err)
 	}
-
-	existing.Labels = desired.Labels
-	ensureOwnerRef(existing, r.deploymentOwnerRef)
-	logger.Info("Updating ServiceAccount", "name", consolePluginName)
-	return r.Update(ctx, existing)
+	vals.Config = cm.Data
+	return vals, nil
 }
 
-func (r *ConsolePluginReconciler) ensureRole(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-	desired := r.buildRole()
-	ensureOwnerRef(desired, r.deploymentOwnerRef)
-
-	existing := &rbacv1.Role{}
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: r.OperatorNamespace}, existing)
-	if apierrors.IsNotFound(err) {
-		logger.Info("Creating Role", "name", consolePluginName)
-		return r.Create(ctx, desired)
+// manifestSourceWithAuth returns a copy of ManifestSource with the pull
+// secret, when configured, resolved into a registry keychain. The secret is
+// read per fetch so credential rotation needs no operator restart.
+func (r *ConsolePluginReconciler) manifestSourceWithAuth(ctx context.Context) (*manifests.Source, error) {
+	src := new(manifests.Source)
+	*src = *r.ManifestSource
+	if src.PullSecretName == "" {
+		return src, nil
 	}
+
+	secret := &v1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: r.OperatorNamespace, Name: src.PullSecretName,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("reading pull secret %s/%s: %w", r.OperatorNamespace, src.PullSecretName, err)
+	}
+	keychain, err := manifests.ParseDockerConfig(secret.Data[".dockerconfigjson"])
 	if err != nil {
-		return fmt.Errorf("failed to get Role: %w", err)
+		return nil, fmt.Errorf("parsing pull secret %s/%s: %w", r.OperatorNamespace, src.PullSecretName, err)
 	}
-
-	existing.Labels = desired.Labels
-	existing.Rules = desired.Rules
-	ensureOwnerRef(existing, r.deploymentOwnerRef)
-	logger.Info("Updating Role", "name", consolePluginName)
-	return r.Update(ctx, existing)
+	src.Keychain = keychain
+	return src, nil
 }
 
-func (r *ConsolePluginReconciler) ensureRoleBinding(ctx context.Context) error {
+// ensureImageManifests renders the plugin resources from the plugin image
+// (pulled in-process, digest-cached) and ensures each one, replacing the Go
+// builders when ManifestSource is set.
+func (r *ConsolePluginReconciler) ensureImageManifests(ctx context.Context, apiServerURL, clusterID string) error {
 	logger := log.FromContext(ctx)
-	desired := r.buildRoleBinding()
-	ensureOwnerRef(desired, r.deploymentOwnerRef)
 
-	existing := &rbacv1.RoleBinding{}
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: r.OperatorNamespace}, existing)
-	if apierrors.IsNotFound(err) {
-		logger.Info("Creating RoleBinding", "name", consolePluginName)
-		return r.Create(ctx, desired)
+	// controller-runtime serializes Reconcile calls per controller, so lazy
+	// initialization needs no extra locking.
+	if r.manifestsCache == nil {
+		r.manifestsCache = manifests.NewCache("")
 	}
+
+	vals, err := r.imageManifestValues(ctx, apiServerURL, clusterID)
 	if err != nil {
-		return fmt.Errorf("failed to get RoleBinding: %w", err)
+		return err
 	}
 
-	// RoleRef is immutable, so a changed one has to be replaced rather than
-	// updated in place.
-	if existing.RoleRef != desired.RoleRef {
-		logger.Info("Replacing RoleBinding with a changed roleRef", "name", consolePluginName)
-		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete RoleBinding: %w", err)
+	src, err := r.manifestSourceWithAuth(ctx)
+	if err != nil {
+		return err
+	}
+	resources, err := r.manifestsCache.Fetch(ctx, *src, vals)
+	if err != nil {
+		return fmt.Errorf("fetching plugin manifests from image: %w", err)
+	}
+
+	for _, res := range resources {
+		logger.Info("Ensuring plugin resource from image",
+			"path", res.Path, "kind", res.Obj.GetKind(), "name", res.Obj.GetName())
+		if err := r.ensureRenderedResource(ctx, res.Obj); err != nil {
+			return err
 		}
-		return r.Create(ctx, desired)
 	}
-
-	existing.Labels = desired.Labels
-	existing.Subjects = desired.Subjects
-	ensureOwnerRef(existing, r.deploymentOwnerRef)
-	logger.Info("Updating RoleBinding", "name", consolePluginName)
-	return r.Update(ctx, existing)
+	return nil
 }
 
-func (r *ConsolePluginReconciler) ensureService(ctx context.Context) error {
+// ensureRenderedResource create-or-updates one rendered resource. All
+// non-metadata content is replaced with the rendered desired state; the
+// generic path covers top-level fields (e.g. Role rules) as well as spec.
+func (r *ConsolePluginReconciler) ensureRenderedResource(ctx context.Context, desired *unstructured.Unstructured) error {
 	logger := log.FromContext(ctx)
-	desired := r.buildService()
-	ensureOwnerRef(desired, r.deploymentOwnerRef)
 
-	existing := &v1.Service{}
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: r.OperatorNamespace}, existing)
-	if apierrors.IsNotFound(err) {
-		logger.Info("Creating Service", "name", consolePluginName)
-		return r.Create(ctx, desired)
+	ownerRef := r.deploymentOwnerRef
+	if desired.GetKind() == consolePluginKind {
+		ownerRef = r.clusterOwnerRef
 	}
-	if err != nil {
-		return fmt.Errorf("failed to get Service: %w", err)
-	}
-
-	existing.Labels = desired.Labels
-	existing.Annotations = desired.Annotations
-	existing.Spec.Ports = desired.Spec.Ports
-	existing.Spec.Selector = desired.Spec.Selector
-	existing.Spec.Type = desired.Spec.Type
-	ensureOwnerRef(existing, r.deploymentOwnerRef)
-	logger.Info("Updating Service", "name", consolePluginName)
-	return r.Update(ctx, existing)
-}
-
-func (r *ConsolePluginReconciler) ensureDeployment(ctx context.Context, apiServerURL, clusterID, ghApiURL string) error {
-	logger := log.FromContext(ctx)
-	desired := r.buildDeployment(apiServerURL, clusterID, ghApiURL)
-	ensureOwnerRef(desired, r.deploymentOwnerRef)
-
-	existing := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName, Namespace: r.OperatorNamespace}, existing)
-	if apierrors.IsNotFound(err) {
-		logger.Info("Creating Deployment", "name", consolePluginName)
-		return r.Create(ctx, desired)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to get Deployment: %w", err)
-	}
-
-	existing.Labels = desired.Labels
-	existing.Spec = desired.Spec
-	ensureOwnerRef(existing, r.deploymentOwnerRef)
-	logger.Info("Updating Deployment", "name", consolePluginName)
-	return r.Update(ctx, existing)
-}
-
-func (r *ConsolePluginReconciler) ensureConsolePlugin(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-	desired := r.buildConsolePlugin()
-	ensureOwnerRef(desired, r.clusterOwnerRef)
 
 	existing := &unstructured.Unstructured{}
-	existing.SetAPIVersion(consolePluginAPIVersion)
-	existing.SetKind(consolePluginKind)
+	existing.SetAPIVersion(desired.GetAPIVersion())
+	existing.SetKind(desired.GetKind())
 
-	err := r.Get(ctx, types.NamespacedName{Name: consolePluginName}, existing)
+	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, existing)
 	if apierrors.IsNotFound(err) {
-		logger.Info("Creating ConsolePlugin", "name", consolePluginName)
+		ensureOwnerRef(desired, ownerRef)
+		logger.Info("Creating resource from image manifests",
+			"kind", desired.GetKind(), "name", desired.GetName())
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to get ConsolePlugin: %w", err)
+		return fmt.Errorf("failed to get %s %s: %w", desired.GetKind(), desired.GetName(), err)
 	}
 
-	existing.Object["spec"] = desired.Object["spec"]
+	for key, val := range desired.Object {
+		if key == "metadata" || key == "status" {
+			continue
+		}
+		existing.Object[key] = val
+	}
 	existing.SetLabels(desired.GetLabels())
-	ensureOwnerRef(existing, r.clusterOwnerRef)
-	logger.Info("Updating ConsolePlugin", "name", consolePluginName)
+	existing.SetAnnotations(desired.GetAnnotations())
+	ensureOwnerRef(existing, ownerRef)
+	logger.Info("Updating resource from image manifests",
+		"kind", desired.GetKind(), "name", desired.GetName())
 	return r.Update(ctx, existing)
 }
 
@@ -970,7 +688,3 @@ func (r *ConsolePluginReconciler) mapToRequest(_ context.Context, _ client.Objec
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: consolePluginName}}}
 }
 
-func parseQuantity(s string) *resource.Quantity {
-	q := resource.MustParse(s)
-	return &q
-}

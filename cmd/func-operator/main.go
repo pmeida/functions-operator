@@ -22,6 +22,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,7 @@ import (
 	functionsdevv1alpha1 "github.com/functions-dev/func-operator/api/v1alpha1"
 	"github.com/functions-dev/func-operator/internal/controller"
 	"github.com/functions-dev/func-operator/internal/funccli"
+	"github.com/functions-dev/func-operator/internal/manifests"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -65,6 +67,31 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 
 	monitoring.RegisterMetrics()
+}
+
+// consolePluginManifestSource returns the source of the console plugin's
+// resource definitions (SRVOCF-1095): the plugin image itself, whose
+// /manifests directory the operator pulls in-process. The image is the
+// single source of truth - there is no fallback to built-in definitions.
+// The operator refuses to start without CONSOLE_PLUGIN_IMAGE so a
+// misconfigured deployment fails immediately rather than at reconcile time.
+func consolePluginManifestSource() *manifests.Source {
+	imageRef := os.Getenv("CONSOLE_PLUGIN_IMAGE")
+	if imageRef == "" {
+		setupLog.Error(nil, "CONSOLE_PLUGIN_IMAGE is required: the console plugin resource definitions are read from that image")
+		os.Exit(1)
+	}
+
+	insecure := false
+	if v, err := strconv.ParseBool(os.Getenv("CONSOLE_PLUGIN_MANIFESTS_INSECURE")); err == nil {
+		insecure = v
+	}
+
+	return &manifests.Source{
+		ImageRef:       imageRef,
+		Insecure:       insecure,
+		PullSecretName: os.Getenv("CONSOLE_PLUGIN_MANIFESTS_PULL_SECRET"),
+	}
 }
 
 type cliFlags struct {
@@ -388,6 +415,7 @@ func main() {
 		OperatorNamespace:  operatorNamespace,
 		ConsolePluginImage: os.Getenv("CONSOLE_PLUGIN_IMAGE"),
 		PodName:            os.Getenv("POD_NAME"),
+		ManifestSource:     consolePluginManifestSource(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ConsolePlugin")
 		os.Exit(1)
